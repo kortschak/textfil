@@ -27,12 +27,22 @@ type Client struct {
 type Prediction struct {
 	Generated Token
 	Top       []Token
+	Timing    Timing
 }
 
 // Token is a single token with its log-probability.
 type Token struct {
 	Text    string
 	Logprob float64
+}
+
+// Timing holds inference timing from an ollama generate response.
+// All duration fields are in nanoseconds.
+type Timing struct {
+	PromptTokens int
+	PromptNanos  int64
+	EvalNanos    int64
+	TotalNanos   int64
 }
 
 // Predict generates one token from prompt and returns the top-k
@@ -93,12 +103,23 @@ func (c *Client) Predict(prompt string, topK int) (Prediction, error) {
 			pred.Top = append(pred.Top, Token{Text: alt.Token, Logprob: alt.Logprob})
 		}
 	}
+	pred.Timing = Timing{
+		PromptTokens: gen.PromptEvalCount,
+		PromptNanos:  gen.PromptEvalDuration,
+		EvalNanos:    gen.EvalDuration,
+		TotalNanos:   gen.TotalDuration,
+	}
 	return pred, nil
 }
 
 type generateResponse struct {
-	Response string         `json:"response"`
-	Logprobs []tokenLogprob `json:"logprobs"`
+	Response           string         `json:"response"`
+	Logprobs           []tokenLogprob `json:"logprobs"`
+	TotalDuration      int64          `json:"total_duration"`
+	PromptEvalCount    int            `json:"prompt_eval_count"`
+	PromptEvalDuration int64          `json:"prompt_eval_duration"`
+	EvalCount          int            `json:"eval_count"`
+	EvalDuration       int64          `json:"eval_duration"`
 }
 
 type tokenLogprob struct {

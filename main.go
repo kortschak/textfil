@@ -88,7 +88,7 @@ func encode(cfg config, words []string, payload []byte, baseSeed uint64, debug b
 	seed := docSeed(baseSeed, words, cfg.ctxLen)
 	enc := fountain.NewEncoder(payload, rand.NewPCG(baseSeed, seed))
 
-	positions := walkText(cfg, working, func(p *pos) {
+	wr := walkText(cfg, working, func(p *pos) {
 		sym := enc.Next()
 		p.bit = sym.Value
 		bare := stripPunct(working[p.wordIdx])
@@ -111,7 +111,7 @@ func encode(cfg config, words []string, payload []byte, baseSeed uint64, debug b
 	usable := enc.N()
 
 	if debug {
-		printDebug(positions, usable, payloadBits)
+		printDebug(wr, usable, payloadBits)
 	}
 
 	if cfg.jsonMode {
@@ -130,7 +130,7 @@ func encode(cfg config, words []string, payload []byte, baseSeed uint64, debug b
 // symbols from each, and reconstructs the payload.
 func decode(cfg config, files []string, payloadBits int, baseSeed uint64, debug bool) {
 	dec := fountain.NewDecoder(payloadBits)
-	var allPositions []pos
+	var combined walkResult
 
 	for i, path := range files {
 		text := readInput(path)
@@ -146,7 +146,7 @@ func decode(cfg config, files []string, payloadBits int, baseSeed uint64, debug 
 		seed := docSeed(baseSeed, words, cfg.ctxLen)
 		stream := fountain.NewStream(payloadBits, rand.NewPCG(baseSeed, seed))
 
-		positions := walkText(cfg, words, func(p *pos) {
+		wr := walkText(cfg, words, func(p *pos) {
 			p.sub = words[p.wordIdx]
 			bare := stripPunct(p.sub)
 			if strings.EqualFold(bare, p.r1) {
@@ -157,13 +157,17 @@ func decode(cfg config, files []string, payloadBits int, baseSeed uint64, debug 
 			dec.Add(stream.Next(p.bit))
 		})
 
-		allPositions = append(allPositions, positions...)
+		combined.positions = append(combined.positions, wr.positions...)
+		combined.predictCalls += wr.predictCalls
+		combined.promptTokens += wr.promptTokens
+		combined.promptNanos += wr.promptNanos
+		combined.evalNanos += wr.evalNanos
 	}
 
 	result := dec.Finish()
 
 	if debug {
-		printDebug(allPositions, dec.N(), payloadBits)
+		printDebug(combined, dec.N(), payloadBits)
 	}
 
 	if cfg.jsonMode {
@@ -231,13 +235,29 @@ func stripPunct(s string) string {
 	})
 }
 
+// walkResult holds the positions and accumulated timing from a walkText call.
+type walkResult struct {
+	positions    []pos
+	predictCalls int
+	promptTokens int
+	promptNanos  int64
+	evalNanos    int64
+}
+
+func (wr *walkResult) addTiming(t ollama.Timing) {
+	wr.predictCalls++
+	wr.promptTokens += t.PromptTokens
+	wr.promptNanos += t.PromptNanos
+	wr.evalNanos += t.EvalNanos
+}
+
 // walkText iterates over candidate word positions in block-sequential
 // order, applying the four-filter pipeline. Positions that pass all
 // filters are handed to handle; skipped positions are recorded with
 // their skip reason. The working array may be modified by handle
 // (the encoder substitutes words in place).
-func walkText(cfg config, words []string, handle func(*pos)) []pos {
-	var positions []pos
+func walkText(cfg config, words []string, handle func(*pos)) walkResult {
+	var wr walkResult
 	var scanned int
 	blockStart := cfg.ctxLen
 
@@ -257,6 +277,7 @@ func walkText(cfg config, words []string, handle func(*pos)) []pos {
 			if err != nil {
 				exitErr(cfg.jsonMode, "predict at word %d: %v", i, err)
 			}
+			wr.addTiming(pred.Timing)
 
 			ww := ollama.WholeWords(pred.Top)
 			p := pos{wordIdx: i, context: ctx, orig: words[i]}
@@ -273,23 +294,25 @@ func walkText(cfg config, words []string, handle func(*pos)) []pos {
 				p.skipped = true
 				p.skipWhy = reason
 				p.sub = words[i]
-				positions = append(positions, p)
+				wr.positions = append(wr.positions, p)
 				continue
 			}
 
-			next1, err := predictNextWord(cfg.client, ctx+" "+p.r1)
+			next1, t1, err := predictNextWord(cfg.client, ctx+" "+p.r1)
 			if err != nil {
 				exitErr(cfg.jsonMode, "forward predict r1 at %d: %v", i, err)
 			}
-			next2, err := predictNextWord(cfg.client, ctx+" "+p.r2)
+			wr.addTiming(t1)
+			next2, t2, err := predictNextWord(cfg.client, ctx+" "+p.r2)
 			if err != nil {
 				exitErr(cfg.jsonMode, "forward predict r2 at %d: %v", i, err)
 			}
+			wr.addTiming(t2)
 			if !strings.EqualFold(next1, next2) {
 				p.skipped = true
 				p.skipWhy = fmt.Sprintf("divergent: %s→%s / %s→%s", p.r1, next1, p.r2, next2)
 				p.sub = words[i]
-				positions = append(positions, p)
+				wr.positions = append(wr.positions, p)
 				continue
 			}
 
@@ -302,19 +325,19 @@ func walkText(cfg config, words []string, handle func(*pos)) []pos {
 				p.skipped = true
 				p.skipWhy = fmt.Sprintf("low similarity %.4f < %.2f (%s/%s)", p.sim, cfg.minSim, p.r1, p.r2)
 				p.sub = words[i]
-				positions = append(positions, p)
+				wr.positions = append(wr.positions, p)
 				continue
 			}
 
 			handle(&p)
-			positions = append(positions, p)
+			wr.positions = append(wr.positions, p)
 		}
 
 		blockStart = blockEnd + cfg.gapSize
 	}
 	fmt.Fprintf(os.Stderr, "\r\033[2K")
 
-	return positions
+	return wr
 }
 
 // config holds the parameters for the watermarking pipeline.
@@ -350,27 +373,28 @@ func shouldSkip(p pos, minR2Prob float64) (bool, string) {
 	return false, ""
 }
 
-// predictNextWord returns the top whole-word prediction for prompt.
-func predictNextWord(c *ollama.Client, prompt string) (string, error) {
+// predictNextWord returns the top whole-word prediction for prompt
+// and the inference timing.
+func predictNextWord(c *ollama.Client, prompt string) (string, ollama.Timing, error) {
 	pred, err := c.Predict(prompt, 10)
 	if err != nil {
-		return "", err
+		return "", ollama.Timing{}, err
 	}
 	ww := ollama.WholeWords(pred.Top)
 	if len(ww) == 0 {
-		return "", nil
+		return "", pred.Timing, nil
 	}
-	return ollama.WordText(ww[0]), nil
+	return ollama.WordText(ww[0]), pred.Timing, nil
 }
 
 // printDebug writes the position table and summary stats to stderr.
-func printDebug(positions []pos, usable, payloadBits int) {
+func printDebug(wr walkResult, usable, payloadBits int) {
 	w := os.Stderr
 	fmt.Fprintf(w, "%-4s  %-30s  %-12s  %-6s  %-6s  %-3s  %-12s  %s\n",
 		"pos", "context", "word", "r1", "r2", "bit", "sub", "note")
 	fmt.Fprintln(w, strings.Repeat("-", 100))
 
-	for _, p := range positions {
+	for _, p := range wr.positions {
 		ctx := p.context
 		if len(ctx) > 30 {
 			ctx = ctx[:27] + "..."
@@ -392,7 +416,7 @@ func printDebug(positions []pos, usable, payloadBits int) {
 	}
 
 	var skippedBase, skippedFunc, skippedDiv, skippedSim, changed int
-	for _, p := range positions {
+	for _, p := range wr.positions {
 		if p.skipped {
 			switch {
 			case strings.HasPrefix(p.skipWhy, "low similarity"):
@@ -411,7 +435,7 @@ func printDebug(positions []pos, usable, payloadBits int) {
 	}
 
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "Positions: %d total, %d usable\n", len(positions), usable)
+	fmt.Fprintf(w, "Positions: %d total, %d usable\n", len(wr.positions), usable)
 	fmt.Fprintf(w, "Skipped: %d base, %d function-word, %d divergent, %d low-similarity\n",
 		skippedBase, skippedFunc, skippedDiv, skippedSim)
 	if payloadBits > 0 && usable > 0 {
@@ -420,6 +444,16 @@ func printDebug(positions []pos, usable, payloadBits int) {
 	}
 	if changed > 0 {
 		fmt.Fprintf(w, "Changes: %d words modified\n", changed)
+	}
+	if wr.predictCalls > 0 {
+		promptS := float64(wr.promptNanos) / 1e9
+		genS := float64(wr.evalNanos) / 1e9
+		fmt.Fprintf(w, "Timing: %d predict calls, %d prompt tokens, %.3fs prompt eval, %.3fs generation\n",
+			wr.predictCalls, wr.promptTokens, promptS, genS)
+		if wr.promptNanos > 0 {
+			fmt.Fprintf(w, "Throughput: %.1f prompt tokens/s\n",
+				float64(wr.promptTokens)/(promptS))
+		}
 	}
 }
 
