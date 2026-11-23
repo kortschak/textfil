@@ -366,6 +366,60 @@ to another candidate's (a "confidence gap" filter), (c) run each
 prediction multiple times and use only positions where the result is
 stable — at the cost of roughly 2-3x more LLM calls per position.
 
+#### Non-determinism vs numerical instability
+
+The desynchronisation is not mere random noise. Two distinct mechanisms
+interact:
+
+1. **Non-determinism at the kernel level.** GPU floating-point
+   reduction is non-associative: `(a + b) + c` and `a + (b + c)` can
+   differ at the last mantissa bits. GPU kernels choose reduction order
+   based on thread scheduling, tiling, and batch shape, so the same
+   computation can produce different rounding on different calls. This
+   is well documented in recent work on LLM inference reproducibility
+   [1][2][3].
+
+2. **Amplification through transformer depth.** These epsilon-scale
+   perturbations would be harmless in a linear system. In a
+   transformer, they are amplified through depth — condition numbers
+   above 10^6 have been reported for a single forward pass [4].
+   The result is a "plateau-and-jump" pattern: most positions produce
+   identical logit rankings across calls, but roughly 15% of positions
+   sit near decision boundaries where the top-k ranking flips [4].
+   This matches our observation that most positions agree between
+   encoder and decoder while a small fraction (2-7%) disagree.
+
+3. **Argmax discontinuity.** The softmax/argmax step turns a
+   continuous logit shift into a discrete ranking change. A linear
+   system with the same condition number would produce a proportionally
+   shifted output; the ranking discontinuity is what turns a small
+   shift into a qualitatively different filter decision.
+
+The practical consequence for textfil is that any position where r2's
+logprob is close to the next candidate's is unreliable: the same
+context can produce different r2 words on different calls, flipping
+filter decisions downstream. The consensus polling approach (below)
+addresses this by voting over multiple calls, effectively smoothing
+out the stochastic ranking at near-tie positions.
+
+Yuan et al. [2] show that using FP32 compute (with BF16 weights)
+eliminates the variation with 34% less memory than full FP32. This
+"LayerCast" approach would likely eliminate the need for polling
+entirely, but requires control over the inference backend. For ollama
+on consumer GPUs, polling at the application level is the available
+option. The CPU backend should also produce bit-exact results, at the
+cost of slower inference.
+
+[1] M. Srivatsa et al., "LLM-42: Enabling Determinism in LLM
+    Inference with Verified Speculation," arXiv:2601.17768, 2026.
+[2] J. Yuan et al., "Understanding and Mitigating Numerical Sources
+    of Nondeterminism in LLM Inference," arXiv:2506.09501, 2025.
+[3] E. Cooper et al., "Accelerating the Mitigation of LLM Inference
+    Nondeterminism Across GPU Architectures," arXiv:2609.25624, 2026.
+[4] A. Ravishankar et al., "Numerical Instability and Chaos:
+    Quantifying the Unpredictability of Large Language Models,"
+    arXiv:2604.13206, 2026.
+
 ### Consensus polling
 
 The `-poll K` flag addresses desynchronisation by calling Predict K
