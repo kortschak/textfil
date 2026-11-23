@@ -40,11 +40,18 @@ func main() {
 	flag.Float64Var(&cfg.minR2, "min-r2", 0.10, "minimum rank-2 probability")
 	flag.Float64Var(&cfg.minSim, "min-sim", 0.50, "minimum r1/r2 embedding similarity")
 	flag.StringVar(&cfg.embedModel, "embed-model", "nomic-embed-text", "embedding model")
+	flag.IntVar(&cfg.poll, "poll", 1, "predict calls per position for consensus (odd, >=1)")
 	flag.BoolVar(&cfg.jsonMode, "json", false, "emit output as JSON to stdout")
 	flag.Parse()
 
 	if cfg.gapSize < cfg.ctxLen {
 		cfg.gapSize = cfg.ctxLen
+	}
+	if cfg.poll < 1 {
+		cfg.poll = 1
+	}
+	if cfg.poll%2 == 0 {
+		cfg.poll++
 	}
 
 	if *bits != 0 {
@@ -273,21 +280,49 @@ func walkText(cfg config, words []string, handle func(*pos)) walkResult {
 			ctxStart := max(i-cfg.ctxLen, 0)
 			ctx := strings.Join(words[ctxStart:i], " ")
 
-			pred, err := cfg.client.Predict(ctx, 10)
-			if err != nil {
-				exitErr(cfg.jsonMode, "predict at word %d: %v", i, err)
-			}
-			wr.addTiming(pred.Timing)
-
-			ww := ollama.WholeWords(pred.Top)
 			p := pos{wordIdx: i, context: ctx, orig: words[i]}
-			if len(ww) >= 1 {
-				p.r1 = ollama.WordText(ww[0])
-				p.r1prob = math.Exp(ww[0].Logprob)
-			}
-			if len(ww) >= 2 {
-				p.r2 = ollama.WordText(ww[1])
-				p.r2prob = math.Exp(ww[1].Logprob)
+			if cfg.poll <= 1 {
+				pred, err := cfg.client.Predict(ctx, 10)
+				if err != nil {
+					exitErr(cfg.jsonMode, "predict at word %d: %v", i, err)
+				}
+				wr.addTiming(pred.Timing)
+				ww := ollama.WholeWords(pred.Top)
+				if len(ww) >= 1 {
+					p.r1 = ollama.WordText(ww[0])
+					p.r1prob = math.Exp(ww[0].Logprob)
+				}
+				if len(ww) >= 2 {
+					p.r2 = ollama.WordText(ww[1])
+					p.r2prob = math.Exp(ww[1].Logprob)
+				}
+			} else {
+				r1Votes := make(map[string]int)
+				r2Votes := make(map[string]int)
+				r1Probs := make(map[string]float64)
+				r2Probs := make(map[string]float64)
+				for k := range cfg.poll {
+					pred, err := cfg.client.Predict(ctx, 10)
+					if err != nil {
+						exitErr(cfg.jsonMode, "predict at word %d (poll %d): %v", i, k, err)
+					}
+					wr.addTiming(pred.Timing)
+					ww := ollama.WholeWords(pred.Top)
+					if len(ww) >= 1 {
+						w := ollama.WordText(ww[0])
+						r1Votes[w]++
+						r1Probs[w] = math.Exp(ww[0].Logprob)
+					}
+					if len(ww) >= 2 {
+						w := ollama.WordText(ww[1])
+						r2Votes[w]++
+						r2Probs[w] = math.Exp(ww[1].Logprob)
+					}
+				}
+				p.r1 = majority(r1Votes)
+				p.r2 = majority(r2Votes)
+				p.r1prob = r1Probs[p.r1]
+				p.r2prob = r2Probs[p.r2]
 			}
 
 			if skip, reason := shouldSkip(p, cfg.minR2); skip {
@@ -340,6 +375,18 @@ func walkText(cfg config, words []string, handle func(*pos)) walkResult {
 	return wr
 }
 
+func majority(votes map[string]int) string {
+	var best string
+	var bestN int
+	for w, n := range votes {
+		if n > bestN {
+			best = w
+			bestN = n
+		}
+	}
+	return best
+}
+
 // config holds the parameters for the watermarking pipeline.
 type config struct {
 	client     *ollama.Client
@@ -349,6 +396,7 @@ type config struct {
 	minR2      float64
 	minSim     float64
 	embedModel string
+	poll       int
 	jsonMode   bool
 }
 

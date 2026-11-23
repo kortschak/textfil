@@ -366,6 +366,66 @@ to another candidate's (a "confidence gap" filter), (c) run each
 prediction multiple times and use only positions where the result is
 stable — at the cost of roughly 2-3x more LLM calls per position.
 
+### Consensus polling
+
+The `-poll K` flag addresses desynchronisation by calling Predict K
+times at each position and taking the majority vote for r1 and r2
+independently. The key design choice is independent voting: r1 and r2
+are each voted on separately rather than voting on (r1, r2) pairs.
+This matters because r1 is often stable while r2 flips between two
+close candidates. If a stable r1="therefore" is paired with r2 that
+alternates between "however" and "in", no single pair gets a reliable
+majority, but independent voting recovers the stable r1 and resolves
+the r2.
+
+K is clamped to odd values (≥1) so ties are impossible with an odd
+number of polls.
+
+#### Pair voting does not converge
+
+The first implementation voted on (r1, r2) pairs jointly. This failed
+on walden, the hardest text:
+
+| Text    | Poll | Voting | Enc usable | Dec usable | Round trip |
+|---------|-----:|--------|:----------:|:----------:|:----------:|
+| darwin  | 1    | —      | 40         | 41         | pass       |
+| darwin  | 3    | pair   | 41         | 41         | pass       |
+| walden  | 3    | pair   | 32         | 33         | fail       |
+| walden  | 5    | pair   | 33         | 32         | fail       |
+
+Walden at poll=5 with pair voting still shows a 1-position
+disagreement and fails to decode.
+
+#### Independent voting fixes the hardest text
+
+Switching to independent r1/r2 voting:
+
+| Text    | Poll | Voting      | Enc usable | Dec usable | Round trip |
+|---------|-----:|-------------|:----------:|:----------:|:----------:|
+| walden  | 5    | independent | 36         | 36         | pass       |
+| darwin  | 3    | independent | 41         | 41         | pass       |
+| wells   | 1    | —           | 50         | 50         | pass       |
+| wells   | 3    | independent | 50         | 50         | pass       |
+
+Walden at poll=5 with independent voting produces perfect agreement
+(36 encode, 36 decode) and successfully decodes the payload. Darwin
+converges at poll=3. Wells already agreed at poll=1 and stays stable
+under polling.
+
+The yield can change with polling: walden goes from 32-33 usable
+positions (poll=1, disagreeing) to 36 (poll=5, agreeing). Polling
+doesn't just stabilise — it can recover positions that were rejected
+in one direction due to a jittered prediction.
+
+#### Cost
+
+Each poll multiplies the number of Predict calls per position by K.
+At poll=5, a ~3800-word text that takes ~4 minutes at poll=1 takes
+roughly 15-20 minutes (the base prediction, two forward predictions,
+and the embedding call remain at 1× each; only the base prediction is
+polled). For the texts tested, poll=3 is sufficient except for walden
+which requires poll=5.
+
 ### Text effect
 
 Yield and reliability vary substantially across texts:
@@ -526,21 +586,17 @@ usable positions, but passes only 1/5 texts vs 3/5. One hypothesis: the
 further. Verifying this would require comparing the specific positions
 where enc_usable and dec_usable disagree across models.
 
-**Can prediction stability be improved?** The desynchronisation comes
-from GPU floating-point non-determinism, not from context contamination.
-The gap size is already sufficient (equal to the context length) and
-increasing it would reduce capacity without fixing the problem. Possible
-approaches: (a) a "confidence gap" filter that rejects positions where
-r2 is close in logprob to the next-ranked word, (b) running each
-prediction 2-3 times and using only positions where the top-2 whole
-words are stable, (c) using the CPU backend for bit-exact reproducibility
-(slower but deterministic).
+**Is poll=3 sufficient in general?** The tested texts converge at poll=3
+except walden (which needs poll=5). A larger corpus would reveal whether
+poll=3 is enough for most texts or whether harder texts routinely need
+poll=5 or higher. A related question: does a "confidence gap" filter
+(rejecting positions where r2's logprob is close to the next candidate)
+achieve similar stabilisation without the extra LLM calls?
 
-**Would a consensus decoding strategy help?** Rather than requiring exact
-agreement on the position set, the decoder could try multiple candidate
-position sets (e.g. with and without borderline positions) and pick the
-one that produces a valid fountain decode. This would be slower but might
-absorb the small desynchronisations.
+**Would the CPU backend eliminate the need for polling?** GPU
+floating-point non-determinism is the root cause. The CPU backend should
+produce bit-exact results, removing the need for polling entirely at the
+cost of slower inference. This has not been tested.
 
 **Is the positive naturalness delta real or an artifact of the judge?**
 The llama judge may systematically favour LLM-predicted words over
