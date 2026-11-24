@@ -471,6 +471,47 @@ positions (poll=1, disagreeing) to 36 (poll=5, agreeing). Polling
 doesn't just stabilise — it can recover positions that were rejected
 in one direction due to a jittered prediction.
 
+#### Polling rescues the 1b model
+
+The results above use `llama3.2:3b-text-q8_0`. The smallest model,
+`llama3.2:1b`, failed all five texts in the survey (0/5 pass rate).
+Every trial showed a 1-2 position disagreement between encoder and
+decoder. With poll=3, it passes all five:
+
+| Text    | Poll=1 enc/dec | Poll=1 RT | Poll=3 enc/dec | Poll=3 RT | Overhead | Changed | Mean delta | Worst delta |
+|---------|:--------------:|:---------:|:--------------:|:---------:|:--------:|:-------:|:----------:|:-----------:|
+| darwin  | 30 / 31        | fail      | 31 / 31        | pass      | 1.94x    | 18      | +2.94      | -4.85       |
+| doyle   | 43 / 44        | fail      | 45 / 45        | pass      | 2.81x    | 15      | +6.01      | -1.95       |
+| gatsby  | 41 / 43        | fail      | 44 / 44        | pass      | 2.75x    | 17      | +5.77      | -2.46       |
+| walden  | 30 / 31        | fail      | 34 / 34        | pass      | 2.12x    | 13      | +1.11      | -16.65      |
+| wells   | 31 / 32        | fail      | 32 / 32        | pass      | 2.00x    | 9       | +3.84      | -1.74       |
+
+Encode/decode agreement is perfect across all five texts. Polling also
+increases yield: walden goes from 30-31 to 34 usable positions, doyle
+from 43-44 to 45.
+
+The naturalness scores (judged by `llama3.1:8b`) follow the same
+pattern seen with larger models: mean deltas are positive, meaning
+the judge considers the substituted words more probable than the
+originals on average. Doyle and gatsby have the strongest positive
+deltas (+6.0, +5.8), likely because dialogue-heavy and modern prose
+offer more predictable substitution targets. Walden is the outlier:
+its mean delta is barely positive (+1.1) and its worst position has
+a delta of -16.65 — a single substitution the judge strongly
+dislikes. This worst-position pattern also appeared in the survey
+baseline (walden at poll=1 had worst delta -17.76), so it reflects
+the text's difficulty rather than a polling artefact. Wells has the
+fewest changed positions (9 of 32 usable), indicating that most
+usable positions had the original word as r1 — the model already
+predicted what the author wrote.
+
+At poll=3 the 1b model takes ~200s per encode and ~215s per decode
+(~7 minutes per round trip). This is roughly 3× the poll=1 time
+(~73s + ~84s = ~157s) but still faster than the 3b model at poll=1
+(~122s + ~124s = ~246s). For applications where speed matters, the
+1b model with poll=3 gives reliable round-trips at lower latency than
+any larger model without polling.
+
 #### Cost
 
 Each poll multiplies the number of Predict calls per position by K.

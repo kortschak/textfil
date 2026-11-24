@@ -37,6 +37,7 @@ func main() {
 	seed := flag.Uint64("seed", 42, "fountain coding seed")
 	minR2 := flag.Float64("min-r2", 0.10, "minimum rank-2 probability")
 	minSim := flag.Float64("min-sim", 0.50, "minimum r1/r2 embedding similarity")
+	poll := flag.Int("poll", 1, "predict calls per position for consensus (odd, >=1)")
 	flag.Parse()
 
 	if *textFile == "" {
@@ -83,6 +84,7 @@ func main() {
 		seed:       *seed,
 		minR2:      *minR2,
 		minSim:     *minSim,
+		poll:       *poll,
 	}
 
 	enc := json.NewEncoder(os.Stdout)
@@ -160,6 +162,7 @@ type trialConfig struct {
 	seed       uint64
 	minR2      float64
 	minSim     float64
+	poll       int
 }
 
 type result struct {
@@ -230,6 +233,7 @@ func runTrial(cfg trialConfig, t trial, rep int) result {
 	seedStr := strconv.FormatUint(cfg.seed, 10)
 	r2Str := strconv.FormatFloat(cfg.minR2, 'f', -1, 64)
 	simStr := strconv.FormatFloat(cfg.minSim, 'f', -1, 64)
+	pollStr := strconv.Itoa(cfg.poll)
 
 	encStart := time.Now()
 	encOut, encStderr, err := execTextfil(cfg.bin,
@@ -241,6 +245,7 @@ func runTrial(cfg trialConfig, t trial, rep int) result {
 		"-seed", seedStr,
 		"-min-r2", r2Str,
 		"-min-sim", simStr,
+		"-poll", pollStr,
 		"-json", "-debug",
 	)
 	r.EncSeconds = time.Since(encStart).Seconds()
@@ -305,6 +310,7 @@ func runTrial(cfg trialConfig, t trial, rep int) result {
 		"-seed", seedStr,
 		"-min-r2", r2Str,
 		"-min-sim", simStr,
+		"-poll", pollStr,
 		"-json", "-debug",
 	)
 	r.DecSeconds = time.Since(decStart).Seconds()
